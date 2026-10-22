@@ -92,6 +92,9 @@ prototype items. Subsequent toggles update only the selected item.
 `firestore.rules` validates student ownership, initial order status, all item prices
 and totals against menu documents, and the required location payload. An order
 may contain at most ten lines (the Firestore rule document-access limit).
+Item and location maps reject undocumented fields. Order creation and location-check
+timestamps must fall between five minutes before and one minute after server
+request time. Keep the ordering device's clock synchronized.
 The location check constrains client data; browser coordinates can still be spoofed.
 
 Admin access requires the `admin: true` Firebase Authentication custom claim,

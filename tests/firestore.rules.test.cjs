@@ -130,3 +130,47 @@ test('full menu seed is allowed for admins and denied atomically for students', 
   }
   assert.equal((await assertSucceeds(getDocs(collection(student, 'menu')))).size, 16);
 });
+
+
+test('unexpected nested keys are rejected in every item, location and check map', async () => {
+  const baseline = order();
+  for (const extra of ['admin', 'metadata', 'notes']) {
+    await assertFails(setDoc(doc(student, 'orders', `extra-item-${extra}`), order({
+      items: [{ ...baseline.items[0], [extra]: 'unexpected' }],
+    })));
+    await assertFails(setDoc(doc(student, 'orders', `extra-location-${extra}`), order({
+      orderLocation: { ...baseline.orderLocation, [extra]: 'unexpected' },
+    })));
+    await assertFails(setDoc(doc(student, 'orders', `extra-check-${extra}`), order({
+      clientLocationCheck: { ...baseline.clientLocationCheck, [extra]: 'unexpected' },
+    })));
+  }
+  // A trailing item must be subject to the same schema as the first item.
+  await assertFails(setDoc(doc(student, 'orders', 'extra-trailing-item'), order({
+    items: [baseline.items[0], { ...baseline.items[0], metadata: 'unexpected' }], total: 160,
+  })));
+});
+
+test('creation and location-check times must be recent and cannot pin future admin queues', async () => {
+  for (const offset of [-600000, 120000, 86400000]) {
+    await assertFails(setDoc(doc(student, 'orders', `created-${offset}`), order({
+      createdAt: Date.now() + offset,
+    })));
+    await assertFails(setDoc(doc(student, 'orders', `checked-${offset}`), order({
+      clientLocationCheck: { ...order().clientLocationCheck, checkedAt: Date.now() + offset },
+    })));
+  }
+  for (const value of ['yesterday', null, 1.5]) {
+    await assertFails(setDoc(doc(student, 'orders', 'invalid-time-type'), order({ createdAt: value })));
+    await assertFails(setDoc(doc(student, 'orders', 'invalid-check-type'), order({
+      clientLocationCheck: { ...order().clientLocationCheck, checkedAt: value },
+    })));
+  }
+  // Exercise allowed skew comfortably inside both bounds to avoid flaky timing.
+  for (const offset of [-240000, 30000]) {
+    await assertSucceeds(setDoc(doc(student, 'orders', `allowed-skew-${offset}`), order({
+      createdAt: Date.now() + offset,
+      clientLocationCheck: { ...order().clientLocationCheck, checkedAt: Date.now() + offset },
+    })));
+  }
+});

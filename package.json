@@ -1,0 +1,14 @@
+{
+  "name": "smart-canteen",
+  "private": true,
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "test": "node --test tests/checkout.test.cjs",
+    "test:rules": "firebase emulators:exec --only firestore --project demo-smart-canteen \"node --test tests/firestore.rules.test.cjs\""
+  },
+  "devDependencies": {
+    "@firebase/rules-unit-testing": "5.0.2",
+    "firebase": "12.1.0",
+    "firebase-tools": "15.34.1"
+  }
+}

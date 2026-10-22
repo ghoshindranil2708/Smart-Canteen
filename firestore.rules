@@ -1,0 +1,95 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function isAdmin() {
+      return request.auth != null && request.auth.token.get('admin', false) == true;
+    }
+
+    // Rules cannot iterate lists. Bound orders to ten lines so every price is
+    // checked within Firestore's ten-document access limit for a single write.
+    function checkedItemTotal(item) {
+      let menu = get(/databases/$(database)/documents/menu/$(item.id)).data;
+      // A null total makes the order's sum comparison fail closed.
+      return item.keys().hasOnly(['id', 'name', 'price', 'qty'])
+        && item.name == menu.name
+        && menu.available == true
+        && item.price == menu.price
+        && item.qty is int && item.qty >= 1 && item.qty <= 20
+        ? item.price * item.qty : null;
+    }
+    function validItems(items, total) {
+      let count = items.size();
+      // Cache the count and validate each present item only once. This keeps
+      // all ten price/schema checks within Firestore's expression budget.
+      return items is list && count >= 1 && count <= 10
+        && total is number
+        && total == checkedItemTotal(items[0])
+          + (count > 1 ? checkedItemTotal(items[1]) : 0)
+          + (count > 2 ? checkedItemTotal(items[2]) : 0)
+          + (count > 3 ? checkedItemTotal(items[3]) : 0)
+          + (count > 4 ? checkedItemTotal(items[4]) : 0)
+          + (count > 5 ? checkedItemTotal(items[5]) : 0)
+          + (count > 6 ? checkedItemTotal(items[6]) : 0)
+          + (count > 7 ? checkedItemTotal(items[7]) : 0)
+          + (count > 8 ? checkedItemTotal(items[8]) : 0)
+          + (count > 9 ? checkedItemTotal(items[9]) : 0);
+    }
+    function recentTimestamp(value) {
+      // Allow five minutes for delivery and one minute of forward clock skew.
+      return value is int
+        && value >= request.time.toMillis() - 300000
+        && value <= request.time.toMillis() + 60000;
+    }
+    function validLocation(order) {
+      let location = order.orderLocation;
+      let check = order.clientLocationCheck;
+      // These assertions constrain the payload, not the device's true position.
+      // Browser-supplied coordinates can be spoofed; GPS is not an auth boundary.
+      return location.keys().hasOnly(['latitude', 'longitude', 'accuracyMeters', 'distanceFromCanteenMeters'])
+        && check.keys().hasOnly(['passed', 'radiusMeters', 'checkedAt'])
+        && check.passed == true && check.radiusMeters == 200
+        && recentTimestamp(check.checkedAt)
+        && location.latitude is number && location.latitude >= -90 && location.latitude <= 90
+        && location.longitude is number && location.longitude >= -180 && location.longitude <= 180
+        && location.accuracyMeters is number
+        && location.accuracyMeters >= 0 && location.accuracyMeters <= 200
+        && location.distanceFromCanteenMeters is number
+        && location.distanceFromCanteenMeters >= 0 && location.distanceFromCanteenMeters <= 200;
+    }
+    function validOrder(order) {
+      return order.keys().hasOnly(['userId', 'token', 'items', 'total', 'status',
+          'customerInfo', 'createdAt', 'orderLocation', 'clientLocationCheck'])
+        && order.userId == request.auth.uid && order.status == 'Placed'
+        && order.token is string && order.token.matches('C[0-9]{5}')
+        && order.customerInfo is string && order.customerInfo.size() <= 200
+        && recentTimestamp(order.createdAt)
+        && validLocation(order) && validItems(order.items, order.total);
+    }
+    match /orders/{orderId} {
+      allow create: if request.auth != null && validOrder(request.resource.data);
+      allow read: if request.auth != null && (resource.data.userId == request.auth.uid || isAdmin());
+      allow update: if isAdmin()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status'])
+        && ((resource.data.status == 'Placed' && request.resource.data.status == 'Preparing')
+          || (resource.data.status == 'Preparing' && request.resource.data.status == 'Ready')
+          || (resource.data.status == 'Ready' && request.resource.data.status == 'Collected'));
+      allow delete: if false;
+    }
+    match /menu/{itemId} {
+      allow read: if true;
+      allow create, update: if isAdmin()
+        && request.resource.data.name is string
+        && request.resource.data.price is number && request.resource.data.price >= 0
+        && request.resource.data.available is bool;
+      allow delete: if isAdmin();
+    }
+    match /settings/seating {
+      allow read: if true;
+      allow create, update: if isAdmin()
+        && request.resource.data.keys().hasOnly(['count'])
+        && request.resource.data.count is int
+        && request.resource.data.count >= 0 && request.resource.data.count <= 100;
+      allow delete: if false;
+    }
+  }
+}

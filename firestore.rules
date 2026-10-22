@@ -1,0 +1,82 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function isAdmin() {
+      return request.auth != null && request.auth.token.get('admin', false) == true;
+    }
+
+    // Rules cannot iterate lists. Bound orders to ten lines so every price is
+    // checked within Firestore's ten-document access limit for a single write.
+    function validItem(item) {
+      let menu = get(/databases/$(database)/documents/menu/$(item.id)).data;
+      return item.name == menu.name
+        && menu.available == true
+        && item.price == menu.price
+        && item.qty is int && item.qty >= 1 && item.qty <= 20;
+    }
+    function checkedLineTotal(items, index) {
+      // Returning null for an invalid line makes the sum comparison fail closed.
+      // Validate and total in one pass to stay within the expression budget.
+      return items.size() <= index ? 0
+        : (validItem(items[index]) ? items[index].price * items[index].qty : null);
+    }
+    function validItems(items, total) {
+      return items is list && items.size() >= 1 && items.size() <= 10
+        && total is number
+        && total == checkedLineTotal(items, 0) + checkedLineTotal(items, 1)
+          + checkedLineTotal(items, 2) + checkedLineTotal(items, 3)
+          + checkedLineTotal(items, 4) + checkedLineTotal(items, 5)
+          + checkedLineTotal(items, 6) + checkedLineTotal(items, 7)
+          + checkedLineTotal(items, 8) + checkedLineTotal(items, 9);
+    }
+    function validLocation(order) {
+      let location = order.orderLocation;
+      let check = order.clientLocationCheck;
+      // These assertions constrain the payload, not the device's true position.
+      // Browser-supplied coordinates can be spoofed; GPS is not an auth boundary.
+      return check.passed == true && check.radiusMeters == 200
+        && check.checkedAt is int
+        && location.latitude is number && location.latitude >= -90 && location.latitude <= 90
+        && location.longitude is number && location.longitude >= -180 && location.longitude <= 180
+        && location.accuracyMeters is number
+        && location.accuracyMeters >= 0 && location.accuracyMeters <= 200
+        && location.distanceFromCanteenMeters is number
+        && location.distanceFromCanteenMeters >= 0 && location.distanceFromCanteenMeters <= 200;
+    }
+    function validOrder(order) {
+      return order.keys().hasOnly(['userId', 'token', 'items', 'total', 'status',
+          'customerInfo', 'createdAt', 'orderLocation', 'clientLocationCheck'])
+        && order.userId == request.auth.uid && order.status == 'Placed'
+        && order.token is string && order.token.matches('C[0-9]{5}')
+        && order.customerInfo is string && order.customerInfo.size() <= 200
+        && order.createdAt is int
+        && validLocation(order) && validItems(order.items, order.total);
+    }
+    match /orders/{orderId} {
+      allow create: if request.auth != null && validOrder(request.resource.data);
+      allow read: if request.auth != null && (resource.data.userId == request.auth.uid || isAdmin());
+      allow update: if isAdmin()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status'])
+        && ((resource.data.status == 'Placed' && request.resource.data.status == 'Preparing')
+          || (resource.data.status == 'Preparing' && request.resource.data.status == 'Ready')
+          || (resource.data.status == 'Ready' && request.resource.data.status == 'Collected'));
+      allow delete: if false;
+    }
+    match /menu/{itemId} {
+      allow read: if true;
+      allow create, update: if isAdmin()
+        && request.resource.data.name is string
+        && request.resource.data.price is number && request.resource.data.price >= 0
+        && request.resource.data.available is bool;
+      allow delete: if isAdmin();
+    }
+    match /settings/seating {
+      allow read: if true;
+      allow create, update: if isAdmin()
+        && request.resource.data.keys().hasOnly(['count'])
+        && request.resource.data.count is int
+        && request.resource.data.count >= 0 && request.resource.data.count <= 100;
+      allow delete: if false;
+    }
+  }
+}

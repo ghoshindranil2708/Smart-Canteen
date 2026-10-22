@@ -7,13 +7,15 @@ import {
   signInAnonymously,
   signInWithEmailAndPassword,
   signOut,
-  onAuthStateChanged
+  onAuthStateChanged,
+  getIdTokenResult
 } from "https://www.gstatic.com/firebasejs/12.1.0/firebase-auth.js";
 
 import {
   getFirestore,
   collection,
-  addDoc,
+  writeBatch,
+  runTransaction,
   doc,
   setDoc,
   getDocs,
@@ -42,7 +44,11 @@ const db = getFirestore(app);
 let uid = null;
 let cart = [];
 let menu = [];
-let seatCount = 18;
+let seatCount = null;
+let menuNeedsSeeding = false;
+let menuReadSucceeded = false;
+let menuUpdatePending = false;
+let unsubscribeSeating = null;
 
 let unsubscribeOrders = null;
 let adminOrdersUnsubscribe = null;
@@ -135,11 +141,15 @@ const fallbackMenu = [
    Firebase first checks whether there is already a
    logged-in user.
 
-   If there is an email -> Admin
-   If there is no email -> Student
+   Only an account with the trusted admin custom claim is an administrator.
 */
 
 onAuthStateChanged(auth, async (user) => {
+  unsubscribeSeating?.();
+  unsubscribeSeating = null;
+  seatCount = null;
+  adminOrdersUnsubscribe?.();
+  adminOrdersUnsubscribe = null;
 
   if (user) {
 
@@ -153,20 +163,24 @@ onAuthStateChanged(auth, async (user) => {
     await loadMenu();
     startLocationTracking();
 
-    /*
-       Email/password account = Admin
-       Anonymous account = Student
-    */
-
-    if (user.email) {
-      showAdminDashboard();
-    } else {
+    // The same custom claim is enforced by Firestore rules.
+    try {
+      const token = await getIdTokenResult(user);
+      if (token.claims.admin === true) {
+        showAdminDashboard();
+      } else {
+        showStudent();
+      }
+    } catch (error) {
+      console.error("Could not verify administrator access:", error);
       showStudent();
     }
 
     return;
   }
 
+
+  uid = null;
 
   /*
      No user currently logged in.
@@ -395,16 +409,19 @@ async function loadMenu() {
         collection(db, "menu")
       );
 
+    menuReadSucceeded = true;
     if (snap.empty) {
 
-      menu = fallbackMenu;
+      menu = fallbackMenu.map(item => ({ ...item }));
+      menuNeedsSeeding = true;
 
     } else {
 
+      menuNeedsSeeding = false;
       menu =
         snap.docs.map((d) => ({
-          id: d.id,
-          ...d.data()
+          ...d.data(),
+          id: d.id
         }));
 
     }
@@ -416,7 +433,10 @@ async function loadMenu() {
       error
     );
 
-    menu = fallbackMenu;
+    menu = fallbackMenu.map(item => ({ ...item }));
+    // A failed read does not prove that the collection is empty.
+    menuNeedsSeeding = false;
+    menuReadSucceeded = false;
 
   }
 
@@ -495,6 +515,8 @@ function readRecentOrders() {
 
 function showStudent() {
 
+  listenToSeating();
+
   const orders = readRecentOrders();
 
 
@@ -519,7 +541,7 @@ function showStudent() {
           🪑 Seats available
 
           <b id="seatCount">
-            ${seatCount}
+            ${seatCount ?? "Loading…"}
           </b>
 
         </div>
@@ -618,9 +640,8 @@ function showStudent() {
 
     <div class="seat">
 
-      <b>
-        ${seatCount}
-        seats currently available
+      <b id="seatingSummary">
+        ${seatCount === null ? "Loading seating…" : `${seatCount} seats currently available`}
       </b>
 
       <br>
@@ -685,6 +706,7 @@ function showStudent() {
   document.querySelectorAll("button[data-add-id]").forEach(button => {
     button.addEventListener("click", () => add(button.dataset.addId));
   });
+  updateLocationUI();
 
 }
 
@@ -889,11 +911,11 @@ async function placeOrder() {
     if (
       !Number.isFinite(accuracy) ||
       accuracy < 0 ||
-      accuracy > 5000
+      accuracy > CANTEEN_LOCATION.radiusMeters
     ) {
 
       throw new Error(
-        "Your GPS accuracy is too low. Please try again."
+        `Your GPS accuracy must be within ${CANTEEN_LOCATION.radiusMeters} metres. Please try again.`
       );
 
     }
@@ -911,6 +933,10 @@ async function placeOrder() {
             .trim()
             .slice(0, 200)
         : "";
+
+    if (cart.length > 10) {
+      throw new Error("Please order at most 10 different items at a time.");
+    }
 
     // Re-check menu locally before creating the order.
     const sanitizedItems = [];
@@ -1548,6 +1574,8 @@ async function loginAdmin() {
 
 function showAdminDashboard() {
 
+  listenToSeating();
+
   renderBase(`
 
     <div class="hero">
@@ -1605,7 +1633,7 @@ function showAdminDashboard() {
         <div class="seat">
 
           <b id="adminSeats">
-            ${seatCount}
+            ${seatCount ?? "Loading…"}
             seats available
           </b>
 
@@ -1661,46 +1689,51 @@ function showAdminDashboard() {
    ADMIN SEATING
 ========================================================= */
 
-function changeSeats(number) {
+function renderSeating() {
+  const count = document.getElementById("seatCount");
+  if (count) count.textContent = seatCount ?? "Unavailable";
+  const summary = document.getElementById("seatingSummary");
+  if (summary) summary.textContent = seatCount === null
+    ? "Seating unavailable" : `${seatCount} seats currently available`;
+  const admin = document.getElementById("adminSeats");
+  if (admin) admin.textContent = seatCount === null
+    ? "Seating unavailable" : `${seatCount} seats available`;
+}
 
-  seatCount =
-    Math.max(
-      0,
-      Math.min(
-        100,
-        seatCount + number
-      )
-    );
+function listenToSeating() {
+  if (unsubscribeSeating) return;
+  unsubscribeSeating = onSnapshot(doc(db, "settings", "seating"), snapshot => {
+    const count = snapshot.exists() ? snapshot.data().count : 18;
+    seatCount = Number.isInteger(count) && count >= 0 && count <= 100 ? count : null;
+    renderSeating();
+  }, error => {
+    console.error("Seating subscription failed:", error);
+    seatCount = null;
+    renderSeating();
+  });
+}
 
-
-  const adminElement =
-    document.getElementById(
-      "adminSeats"
-    );
-
-
-  if (adminElement) {
-
-    adminElement.textContent =
-      seatCount +
-      " seats available";
-
+async function changeSeats(number) {
+  if (!Number.isInteger(number)) return;
+  try {
+    const ref = doc(db, "settings", "seating");
+    // Read inside the transaction so simultaneous operators do not lose updates.
+    const count = await runTransaction(db, async transaction => {
+      const snapshot = await transaction.get(ref);
+      const current = snapshot.exists() ? snapshot.data().count : 18;
+      if (!Number.isInteger(current) || current < 0 || current > 100) {
+        throw new Error("Invalid seating count.");
+      }
+      const next = Math.max(0, Math.min(100, current + number));
+      transaction.set(ref, { count: next });
+      return next;
+    });
+    seatCount = count;
+    renderSeating();
+  } catch (error) {
+    console.error("Seating update failed:", error);
+    alert("Could not update seating. Check your admin permissions and connection.");
   }
-
-
-  const studentElement =
-    document.getElementById(
-      "seatCount"
-    );
-
-
-  if (studentElement) {
-
-    studentElement.textContent =
-      seatCount;
-
-  }
-
 }
 
 
@@ -1761,6 +1794,11 @@ function renderAdminMenu() {
 
 
 async function toggleMenu(id) {
+  if (menuUpdatePending) return;
+  if (!menuReadSucceeded) {
+    alert("Could not load the current menu. Reload before changing availability.");
+    return;
+  }
 
   const item =
     menu.find(
@@ -1773,6 +1811,7 @@ async function toggleMenu(id) {
   }
 
 
+  menuUpdatePending = true;
   const oldValue =
     item.available;
 
@@ -1783,15 +1822,15 @@ async function toggleMenu(id) {
 
   try {
 
-    await setDoc(
-      doc(
-        db,
-        "menu",
-        id
-      ),
-      item
-    );
-
+    if (menuNeedsSeeding) {
+      // One atomic commit avoids exposing a partially initialized collection.
+      const batch = writeBatch(db);
+      menu.forEach(entry => batch.set(doc(db, "menu", String(entry.id)), entry));
+      await batch.commit();
+      menuNeedsSeeding = false;
+    } else {
+      await setDoc(doc(db, "menu", String(id)), item);
+    }
 
     renderAdminMenu();
 
@@ -1812,6 +1851,8 @@ async function toggleMenu(id) {
       "Could not update menu. Check Firebase permissions."
     );
 
+  } finally {
+    menuUpdatePending = false;
   }
 
 }

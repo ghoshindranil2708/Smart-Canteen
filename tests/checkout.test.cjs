@@ -8,7 +8,8 @@ const vm = require('node:vm');
 const source = fs.readFileSync(require('node:path').join(__dirname, '../app.js'), 'utf8')
   .replace(/^import[\s\S]*?from\s+["'][^"']+["'];/gm, '');
 
-function checkout({ writeError, storageError, locationError, writeGate } = {}) {
+function checkout({ writeError, storageError, locationError, writeGate, accuracy = 10 } = {}) {
+  let authChange;
   const saved = [];
   const alerts = [];
   const listeners = [];
@@ -23,7 +24,9 @@ function checkout({ writeError, storageError, locationError, writeGate } = {}) {
     initializeApp: () => ({}),
     getAuth: () => ({}),
     getFirestore: () => ({}),
-    onAuthStateChanged() {},
+    onAuthStateChanged(_auth, callback) { authChange = callback; },
+    getIdTokenResult: async () => ({ claims: {} }),
+    getDocs: async () => ({ empty: true }),
     collection: (_db, path) => ({ path }),
     query: ref => ref,
     orderBy: () => ({}),
@@ -53,9 +56,10 @@ function checkout({ writeError, storageError, locationError, writeGate } = {}) {
     },
     navigator: {
       geolocation: {
+        watchPosition: () => 0,
         getCurrentPosition(success, failure) {
           if (locationError) return failure({ code: 1 });
-          success({ coords: { latitude: 22.572927, longitude: 88.437494, accuracy: 10 } });
+          success({ coords: { latitude: 22.572927, longitude: 88.437494, accuracy } });
         },
       },
     },
@@ -70,6 +74,7 @@ function checkout({ writeError, storageError, locationError, writeGate } = {}) {
   vm.runInContext('uid = "synthetic-student"; menu = fallbackMenu.map(item => ({...item})); cart = [{...menu[0], qty: 2}];', context);
   return { context, saved, alerts, listeners, storage, root, modal, button,
     run: () => vm.runInContext('placeOrder()', context),
+    authChange: user => authChange(user),
     cartLength: () => vm.runInContext('cart.length', context) };
 }
 
@@ -123,6 +128,19 @@ test('failed Firebase write preserves cart and permits retry', async () => {
   assert.doesNotMatch(app.root.innerHTML, /Order confirmed/);
   await app.run();
   assert.equal(app.alerts.length, 2);
+});
+
+test('GPS accuracy cannot exceed the ordering radius', async () => {
+  for (const accuracy of [201, 5000, -1, NaN, Infinity]) {
+    const app = checkout({ accuracy });
+    await app.run();
+    assert.equal(app.saved.length, 0);
+    assert.equal(app.cartLength(), 1);
+    assert.match(app.alerts[0], /accuracy must be within 200/);
+  }
+  const boundary = checkout({ accuracy: 200 });
+  await boundary.run();
+  assert.equal(boundary.saved.length, 1);
 });
 
 test('denied location prevents order creation and preserves cart', async () => {
@@ -202,4 +220,95 @@ test('order and menu content is escaped and action values stay out of JavaScript
   vm.runInContext('showOrder({id: orderId, token: payload, total: 80})', app.context);
   assert.doesNotMatch(app.root.innerHTML, /<img/);
   assert.match(app.root.innerHTML, /&lt;img/);
+});
+
+test('first menu toggle atomically seeds all items, subsequent toggles update one', async () => {
+  const app = checkout();
+  app.context.getDocs = async () => ({ empty: true });
+  const batches = [];
+  app.context.writeBatch = () => {
+    const entries = [];
+    return { set: (ref, item) => entries.push({ ref, item: { ...item } }),
+      commit: async () => batches.push(entries) };
+  };
+  await vm.runInContext('loadMenu();', app.context);
+  await vm.runInContext('toggleMenu("1")', app.context);
+  assert.equal(batches.length, 1);
+  assert.equal(batches[0].length, 6);
+  assert.equal(batches[0][0].item.available, false);
+  await vm.runInContext('toggleMenu("2")', app.context);
+  assert.equal(batches.length, 1);
+  assert.equal(app.saved.length, 1);
+  assert.equal(app.saved[0].ref.id, '2');
+});
+
+test('failed menu seed rolls back toggle and retries the full batch', async () => {
+  const app = checkout();
+  app.context.getDocs = async () => ({ empty: true });
+  let fail = true;
+  const sizes = [];
+  app.context.writeBatch = () => {
+    let size = 0;
+    return { set() { size++; }, commit: async () => {
+      sizes.push(size);
+      if (fail) throw new Error('offline');
+    } };
+  };
+  await vm.runInContext('loadMenu()', app.context);
+  await vm.runInContext('toggleMenu("1")', app.context);
+  assert.equal(vm.runInContext('menu[0].available', app.context), true);
+  fail = false;
+  await vm.runInContext('toggleMenu("1")', app.context);
+  assert.deepEqual(sizes, [6, 6]);
+});
+
+test('seating changes persist transactionally and live snapshots update student counts', async () => {
+  const app = checkout();
+  const elements = { seatCount: {}, adminSeats: {}, seatingSummary: {} };
+  app.context.document.getElementById = id => elements[id] ?? null;
+  app.context.runTransaction = async (_db, callback) => callback({
+    get: async () => ({ exists: () => true, data: () => ({ count: 42 }) }),
+    set: (ref, data) => app.saved.push({ ref, data }),
+  });
+  await vm.runInContext('changeSeats(5)', app.context);
+  assert.equal(app.saved[0].ref.path, 'settings');
+  assert.equal(app.saved[0].ref.id, 'seating');
+  assert.equal(app.saved[0].data.count, 47);
+  vm.runInContext('listenToSeating(); listenToSeating()', app.context);
+  assert.equal(app.listeners.length, 1);
+  app.listeners[0].callback({ exists: () => true, data: () => ({ count: 31 }) });
+  assert.equal(elements.seatCount.textContent, 31);
+  assert.equal(elements.adminSeats.textContent, '31 seats available');
+  assert.equal(elements.seatingSummary.textContent, '31 seats currently available');
+});
+
+test('failed seating transaction keeps the displayed count', async () => {
+  const app = checkout();
+  vm.runInContext('seatCount = 42', app.context);
+  app.context.runTransaction = async () => { throw new Error('permission denied'); };
+  await vm.runInContext('changeSeats(5)', app.context);
+  assert.equal(vm.runInContext('seatCount', app.context), 42);
+  assert.match(app.alerts[0], /Could not update seating/);
+});
+
+test('email alone does not grant admin UI access; trusted custom claim does', async () => {
+  const app = checkout();
+  await app.authChange({ uid: 'ordinary', email: 'ordinary@example.test' });
+  assert.doesNotMatch(app.root.innerHTML, /Admin Dashboard/);
+  app.context.getIdTokenResult = async () => ({ claims: { admin: true } });
+  await app.authChange({ uid: 'operator', email: 'operator@example.test' });
+  assert.match(app.root.innerHTML, /Admin Dashboard/);
+  app.context.getIdTokenResult = async () => { throw new Error('offline'); };
+  await app.authChange({ uid: 'ordinary', email: 'ordinary@example.test' });
+  assert.doesNotMatch(app.root.innerHTML, /Admin Dashboard/);
+});
+
+test('failed menu read does not seed and overwrite a collection whose state is unknown', async () => {
+  const app = checkout();
+  app.context.getDocs = async () => { throw new Error('offline'); };
+  app.context.writeBatch = () => { throw new Error('must not seed after a failed read'); };
+  await vm.runInContext('loadMenu()', app.context);
+  await vm.runInContext('toggleMenu("1")', app.context);
+  assert.equal(app.saved.length, 0);
+  assert.match(app.alerts[0], /Could not load the current menu/);
 });

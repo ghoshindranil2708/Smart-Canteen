@@ -69,6 +69,22 @@ Smart Canteen provides a digital ordering workflow to make the process more orga
 **Live Website:**
 https://smart-canteen-e699d.web.app/
 
+## Run the corrected source locally
+
+The runnable frontend is now in the repository root. The ZIP is the original
+prototype and does not contain the checkout fixes.
+
+1. Copy `config.example.js` to `config.js` and enter your Firebase web app configuration.
+2. Enable Anonymous sign-in in Firebase Authentication and configure Firestore.
+3. Run `python3 -m http.server 8000` from the repository root.
+4. Open `http://localhost:8000` and allow location access. Ordering requires being
+   within the configured 200 m canteen zone in `app.js`.
+
+Run checkout regression tests with `node --test tests/checkout.test.cjs` (Node 24).
+These tests use synthetic Firebase responses and do not write to the live database.
+Deploy the corrected root frontend through your existing Firebase Hosting setup
+to apply the fix to the live website.
+
 ## 📂 Project Structure
 
 ```text
